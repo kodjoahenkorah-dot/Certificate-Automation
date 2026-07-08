@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cert-renewal"
+version = "0.1.0"
+description = "Opt-in automated SSL/TLS certificate renewal engine for Clear Ops (multi-tenant Azure cloud management)"
+readme = "README_INTEGRATION.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+# The core engine has zero hard dependencies. Install only what you need:
+sqlalchemy = ["SQLAlchemy>=2.0"]
+api = ["fastapi>=0.104", "pydantic>=2.0"]
+azure = [
+    "azure-identity>=1.15",
+    "azure-keyvault-certificates>=4.8",
+    "azure-mgmt-web>=7.2",
+]
+acme = ["acme>=2.7", "josepy>=1.13", "cryptography>=41.0"]
+all = [
+    "SQLAlchemy>=2.0",
+    "fastapi>=0.104",
+    "pydantic>=2.0",
+    "azure-identity>=1.15",
+    "azure-keyvault-certificates>=4.8",
+    "azure-mgmt-web>=7.2",
+    "acme>=2.7",
+    "josepy>=1.13",
+    "cryptography>=41.0",
+]
+dev = ["pytest>=7.4", "pytest-asyncio>=0.21"]
+
+[tool.setuptools.packages.find]
+include = ["cert_renewal*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
