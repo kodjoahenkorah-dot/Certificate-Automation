@@ -1,31 +1,76 @@
+"use client";
+
 /**
  * CertificateRenewalPanel — opt-in automated renewal UI for one certificate.
  *
- * Drop into the certificate row expansion or detail drawer on the
- * Certificates page. Self-contained: no UI library, inline styles matching
- * the Clear Ops look (light background, rounded cards, pill badges — red
- * expired / orange expiring / teal healthy — clean sans-serif).
+ * Next.js 14 client component for the certificate row expansion or detail
+ * drawer on the Certificates page. Self-contained: no UI library, inline
+ * styles matching the Clear Ops look (light background, rounded cards, pill
+ * badges — red expired / orange expiring / teal healthy — clean sans-serif).
  *
- * Props:
- *   certificate      {id, tenantId, name, domains?, thumbprint?, issuer?,
- *                     source ("key_vault"|"app_service"|"external"),
- *                     expiresAt (ISO), ownerName?, ownerEmail?}
- *   renewalState     null while loading, else the GET .../renewal response:
- *                    {policy: {autoRenewEnabled, enabledBy, enabledAt,
- *                              renewalWindowDays, effectiveDryRun,
- *                              renewalMethod}, recentAttempts: [...]}
- *   onEnable(windowDays)  -> Promise   PUT .../renewal/enable
- *   onDisable()           -> Promise   PUT .../renewal/disable
- *   onUpdateWindow(days)  -> Promise   PATCH .../renewal
- *   onUpdateMode(mode)    -> Promise   PATCH .../renewal {renewal_mode} (optional)
- *                             mode: "automatic" | "approval_required"
- *   onTriggerNow()        -> Promise   POST .../renewal/trigger  (optional)
- *
- * The parent owns data fetching and refetches renewalState after each
- * callback resolves; this component only renders state and collects intent.
+ * The parent owns data fetching (via the API routes in CertRenewal.Api) and
+ * refetches renewalState after each callback resolves; this component only
+ * renders state and collects intent.
  */
 
 import React, { useMemo, useState } from "react";
+
+export type RenewalMode = "automatic" | "approval_required";
+
+export interface CertificateInfo {
+  id: string;
+  tenantId: string;
+  name: string;
+  source: "key_vault" | "app_service" | "external";
+  expiresAt: string; // ISO
+  domains?: string[];
+  thumbprint?: string | null;
+  issuer?: string | null;
+  ownerName?: string | null;
+  ownerEmail?: string | null;
+}
+
+export interface RenewalPolicyInfo {
+  autoRenewEnabled: boolean;
+  renewalMode?: RenewalMode;
+  enabledBy?: string | null;
+  enabledAt?: string | null;
+  renewalWindowDays: number;
+  effectiveDryRun: boolean;
+  renewalMethod?: "key_vault" | "app_service" | "acme" | "manual";
+}
+
+export interface RenewalAttemptInfo {
+  id: string;
+  status: "pending" | "in_progress" | "succeeded" | "failed" | "manual_required";
+  method?: string | null;
+  dryRun: boolean;
+  attemptNumber: number;
+  triggeredBy: string;
+  startedAt: string;
+  finishedAt?: string | null;
+  newExpiresAt?: string | null;
+  newThumbprint?: string | null;
+  error?: string | null;
+  workItemId?: string | null;
+  detail?: string | null;
+}
+
+export interface RenewalState {
+  policy: RenewalPolicyInfo;
+  recentAttempts: RenewalAttemptInfo[];
+}
+
+export interface CertificateRenewalPanelProps {
+  certificate: CertificateInfo;
+  /** null while loading, else the GET .../renewal response. */
+  renewalState: RenewalState | null;
+  onEnable: (windowDays: number) => Promise<unknown>;
+  onDisable: () => Promise<unknown>;
+  onUpdateWindow: (days: number) => Promise<unknown>;
+  onUpdateMode?: (mode: RenewalMode) => Promise<unknown>;
+  onTriggerNow?: () => Promise<unknown>;
+}
 
 const palette = {
   text: "#16243d",
@@ -46,16 +91,28 @@ const palette = {
   greenBg: "#e9f7f0",
   gray: "#66738a",
   grayBg: "#eef1f6",
+} as const;
+
+const METHOD_LABELS: Record<string, { label: string; hint: string }> = {
+  key_vault: {
+    label: "Azure Key Vault",
+    hint: "Re-issued via the vault's certificate policy",
+  },
+  app_service: {
+    label: "Azure App Service",
+    hint: "Managed certificate re-issued via the Azure management API",
+  },
+  acme: {
+    label: "ACME (Let's Encrypt / ZeroSSL)",
+    hint: "Re-issued with DNS-01 or HTTP-01 domain validation",
+  },
+  manual: {
+    label: "Manual (Work Item)",
+    hint: "Paid CA — a renewal Work Item is created for the certificate owner",
+  },
 };
 
-const METHOD_LABELS = {
-  key_vault: { label: "Azure Key Vault", hint: "Re-issued via the vault's certificate policy" },
-  app_service: { label: "Azure App Service", hint: "Managed certificate re-issued via the Azure management API" },
-  acme: { label: "ACME (Let's Encrypt / ZeroSSL)", hint: "Re-issued with DNS-01 or HTTP-01 domain validation" },
-  manual: { label: "Manual (Work Item)", hint: "Paid CA — a renewal Work Item is created for the certificate owner" },
-};
-
-const STATUS_STYLES = {
+const STATUS_STYLES: Record<string, { color: string; bg: string; label: string }> = {
   succeeded: { color: palette.green, bg: palette.greenBg, label: "Succeeded" },
   failed: { color: palette.red, bg: palette.redBg, label: "Failed" },
   manual_required: { color: palette.orange, bg: palette.orangeBg, label: "Manual required" },
@@ -63,7 +120,7 @@ const STATUS_STYLES = {
   pending: { color: palette.gray, bg: palette.grayBg, label: "Pending" },
 };
 
-function Pill({ color, bg, children }) {
+function Pill({ color, bg, children }: { color: string; bg: string; children: React.ReactNode }) {
   return (
     <span
       style={{
@@ -82,16 +139,22 @@ function Pill({ color, bg, children }) {
   );
 }
 
-function ExpiryPill({ expiresAt }) {
-  const days = Math.floor((new Date(expiresAt) - Date.now()) / 86400000);
-  if (days <= 0)
-    return <Pill color={palette.red} bg={palette.redBg}>Expired</Pill>;
-  if (days <= 30)
-    return <Pill color={palette.orange} bg={palette.orangeBg}>{days} days</Pill>;
+function ExpiryPill({ expiresAt }: { expiresAt: string }) {
+  const days = Math.floor((new Date(expiresAt).getTime() - Date.now()) / 86400000);
+  if (days <= 0) return <Pill color={palette.red} bg={palette.redBg}>Expired</Pill>;
+  if (days <= 30) return <Pill color={palette.orange} bg={palette.orangeBg}>{days} days</Pill>;
   return <Pill color={palette.teal} bg={palette.tealBg}>{days} days</Pill>;
 }
 
-function Toggle({ on, disabled, onChange }) {
+function Toggle({
+  on,
+  disabled,
+  onChange,
+}: {
+  on: boolean;
+  disabled: boolean;
+  onChange: (next: boolean) => void;
+}) {
   return (
     <button
       type="button"
@@ -128,7 +191,7 @@ function Toggle({ on, disabled, onChange }) {
   );
 }
 
-function SectionLabel({ children }) {
+function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
     <div
       style={{
@@ -145,17 +208,19 @@ function SectionLabel({ children }) {
   );
 }
 
-function formatDateTime(iso) {
+function formatDateTime(iso?: string | null): string {
   if (!iso) return "—";
-  const d = new Date(iso);
-  return d.toLocaleString(undefined, {
-    year: "numeric", month: "short", day: "numeric",
-    hour: "2-digit", minute: "2-digit",
+  return new Date(iso).toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
   });
 }
 
-function AttemptRow({ attempt }) {
-  const s = STATUS_STYLES[attempt.status] || STATUS_STYLES.pending;
+function AttemptRow({ attempt }: { attempt: RenewalAttemptInfo }) {
+  const s = STATUS_STYLES[attempt.status] ?? STATUS_STYLES.pending;
   return (
     <div
       style={{
@@ -167,9 +232,7 @@ function AttemptRow({ attempt }) {
       }}
     >
       <Pill color={s.color} bg={s.bg}>{s.label}</Pill>
-      {attempt.dryRun && (
-        <Pill color={palette.gray} bg={palette.grayBg}>Dry run</Pill>
-      )}
+      {attempt.dryRun && <Pill color={palette.gray} bg={palette.grayBg}>Dry run</Pill>}
       <div style={{ flex: 1, minWidth: 0 }}>
         <div style={{ fontSize: 13, color: palette.text }}>
           {formatDateTime(attempt.startedAt)}
@@ -180,9 +243,7 @@ function AttemptRow({ attempt }) {
         {attempt.status === "succeeded" && attempt.newExpiresAt && (
           <div style={{ fontSize: 12, color: palette.green, marginTop: 2 }}>
             New expiry {formatDateTime(attempt.newExpiresAt)}
-            {attempt.newThumbprint
-              ? ` · ${attempt.newThumbprint.slice(0, 16)}…`
-              : ""}
+            {attempt.newThumbprint ? ` · ${attempt.newThumbprint.slice(0, 16)}…` : ""}
           </div>
         )}
         {attempt.error && (
@@ -213,31 +274,31 @@ export default function CertificateRenewalPanel({
   onUpdateWindow,
   onUpdateMode,
   onTriggerNow,
-}) {
+}: CertificateRenewalPanelProps) {
   const policy = renewalState?.policy;
-  const attempts = renewalState?.recentAttempts || [];
+  const attempts = renewalState?.recentAttempts ?? [];
   const enabled = !!policy?.autoRenewEnabled;
 
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(null);
-  const [windowDraft, setWindowDraft] = useState(null);
+  const [error, setError] = useState<string | null>(null);
+  const [windowDraft, setWindowDraft] = useState<number | null>(null);
 
   const windowDays = windowDraft ?? policy?.renewalWindowDays ?? 30;
-  const method = METHOD_LABELS[policy?.renewalMethod] || METHOD_LABELS.manual;
+  const method = METHOD_LABELS[policy?.renewalMethod ?? "manual"];
 
   const daysLeft = useMemo(
-    () => Math.floor((new Date(certificate.expiresAt) - Date.now()) / 86400000),
+    () => Math.floor((new Date(certificate.expiresAt).getTime() - Date.now()) / 86400000),
     [certificate.expiresAt]
   );
   const urgent = daysLeft <= 30;
 
-  const run = async (fn) => {
+  const run = async (fn: () => Promise<unknown>) => {
     setBusy(true);
     setError(null);
     try {
       await fn();
     } catch (e) {
-      setError(e?.message || "Request failed");
+      setError(e instanceof Error ? e.message : "Request failed");
     } finally {
       setBusy(false);
     }
@@ -246,8 +307,7 @@ export default function CertificateRenewalPanel({
   return (
     <div
       style={{
-        fontFamily:
-          "'Inter','Segoe UI',system-ui,-apple-system,sans-serif",
+        fontFamily: "'Inter','Segoe UI',system-ui,-apple-system,sans-serif",
         background: palette.cardBg,
         border: `1px solid ${palette.border}`,
         borderRadius: 14,
@@ -266,9 +326,7 @@ export default function CertificateRenewalPanel({
         <Toggle
           on={enabled}
           disabled={busy || !renewalState}
-          onChange={(next) =>
-            run(() => (next ? onEnable(windowDays) : onDisable()))
-          }
+          onChange={(next) => run(() => (next ? onEnable(windowDays) : onDisable()))}
         />
       </div>
       <div style={{ fontSize: 13, color: palette.textSoft, marginBottom: 16 }}>
@@ -295,7 +353,7 @@ export default function CertificateRenewalPanel({
       )}
 
       {/* Opt-in provenance + dry-run notice */}
-      {enabled && (
+      {enabled && policy && (
         <div style={{ fontSize: 12, color: palette.textFaint, marginBottom: 16 }}>
           Enabled by {policy.enabledBy || "unknown"} on {formatDateTime(policy.enabledAt)}
           {policy.effectiveDryRun && (
@@ -308,28 +366,12 @@ export default function CertificateRenewalPanel({
 
       {/* Method + window */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}>
-        <div
-          style={{
-            flex: "1 1 220px",
-            background: palette.panelBg,
-            borderRadius: 10,
-            padding: "12px 14px",
-          }}
-        >
+        <div style={{ flex: "1 1 220px", background: palette.panelBg, borderRadius: 10, padding: "12px 14px" }}>
           <SectionLabel>Renewal method</SectionLabel>
           <div style={{ fontSize: 14, fontWeight: 600 }}>{method.label}</div>
-          <div style={{ fontSize: 12, color: palette.textSoft, marginTop: 2 }}>
-            {method.hint}
-          </div>
+          <div style={{ fontSize: 12, color: palette.textSoft, marginTop: 2 }}>{method.hint}</div>
         </div>
-        <div
-          style={{
-            flex: "1 1 160px",
-            background: palette.panelBg,
-            borderRadius: 10,
-            padding: "12px 14px",
-          }}
-        >
+        <div style={{ flex: "1 1 160px", background: palette.panelBg, borderRadius: 10, padding: "12px 14px" }}>
           <SectionLabel>Renew before expiry</SectionLabel>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <input
@@ -366,22 +408,17 @@ export default function CertificateRenewalPanel({
       </div>
 
       {/* Renewal mode: fully automatic vs human approval per cycle */}
-      {enabled && onUpdateMode && (
-        <div
-          style={{
-            background: palette.panelBg,
-            borderRadius: 10,
-            padding: "12px 14px",
-            marginBottom: 16,
-          }}
-        >
+      {enabled && policy && onUpdateMode && (
+        <div style={{ background: palette.panelBg, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
           <SectionLabel>Renewal mode</SectionLabel>
           <div style={{ display: "flex", gap: 8 }}>
-            {[
-              ["automatic", "Automatic"],
-              ["approval_required", "Require approval"],
-            ].map(([value, label]) => {
-              const active = (policy.renewalMode || "automatic") === value;
+            {(
+              [
+                ["automatic", "Automatic"],
+                ["approval_required", "Require approval"],
+              ] as const
+            ).map(([value, label]) => {
+              const active = (policy.renewalMode ?? "automatic") === value;
               return (
                 <button
                   key={value}
@@ -404,10 +441,9 @@ export default function CertificateRenewalPanel({
               );
             })}
           </div>
-          {(policy.renewalMode || "automatic") === "approval_required" && (
+          {(policy.renewalMode ?? "automatic") === "approval_required" && (
             <div style={{ fontSize: 12, color: palette.textSoft, marginTop: 8 }}>
-              Each renewal cycle pauses until someone approves it in the
-              renewal approvals queue.
+              Each renewal cycle pauses until someone approves it in the renewal approvals queue.
             </div>
           )}
         </div>
