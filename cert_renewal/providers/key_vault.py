@@ -102,3 +102,22 @@ class KeyVaultRenewalProvider(RenewalProvider):
             new_thumbprint=thumbprint,
             detail=f"New version created in {cert.key_vault_url} (issuer '{issuer}').",
         )
+
+    def verify(self, cert: Certificate, result, ctx: ProviderContext):
+        """Re-read the current certificate version and confirm the vault
+        really serves the new expiry before the engine records success."""
+        from azure.keyvault.certificates import CertificateClient
+
+        client = CertificateClient(
+            vault_url=cert.key_vault_url, credential=ctx.azure_credential
+        )
+        current = client.get_certificate(cert.key_vault_cert_name)
+        expires_on = current.properties.expires_on
+        if expires_on and expires_on.tzinfo is None:
+            expires_on = expires_on.replace(tzinfo=timezone.utc)
+        if not expires_on or expires_on <= cert.expires_at:
+            return (
+                f"Vault still reports expiry {expires_on} "
+                f"(previous expiry {cert.expires_at})."
+            )
+        return None

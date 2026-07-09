@@ -33,9 +33,20 @@ from pydantic import BaseModel, Field
 
 from cert_renewal import policy as policy_mod
 from cert_renewal.config import RenewalConfig
-from cert_renewal.engine import RenewalEngine, RenewalSkipped, select_method
-from cert_renewal.models.domain import RenewalAttempt, RenewalPolicy
+from cert_renewal.engine import (
+    ApprovalPending,
+    RenewalEngine,
+    RenewalSkipped,
+    select_method,
+)
+from cert_renewal.models.domain import (
+    RenewalApproval,
+    RenewalAttempt,
+    RenewalMode,
+    RenewalPolicy,
+)
 from cert_renewal.repository import (
+    ApprovalRepository,
     AttemptRepository,
     CertRepository,
     PolicyRepository,
@@ -49,6 +60,7 @@ class Services:
     attempts: AttemptRepository
     engine: RenewalEngine
     config: RenewalConfig
+    approvals: Optional[ApprovalRepository] = None  # for APPROVAL_REQUIRED mode
 
 
 def get_services() -> Services:  # pragma: no cover - wired by host app
@@ -83,19 +95,57 @@ def authorize_tenant(tenant_id: str, actor: str) -> None:
 
 class EnableRequest(BaseModel):
     renewal_window_days: Optional[int] = Field(default=None, ge=1, le=365)
+    # "automatic" or "approval_required"; default automatic
+    renewal_mode: Optional[RenewalMode] = None
 
 
 class PatchRequest(BaseModel):
     renewal_window_days: Optional[int] = Field(default=None, ge=1, le=365)
+    renewal_mode: Optional[RenewalMode] = None
     dry_run_override: Optional[bool] = None
     max_attempts: Optional[int] = Field(default=None, ge=1, le=10)
     retry_interval_minutes: Optional[int] = Field(default=None, ge=5)
+
+
+class ApprovalDecision(BaseModel):
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+class ApprovalOut(BaseModel):
+    id: str
+    certificate_id: str
+    expiration_window_key: str
+    status: str
+    requested_by: str
+    requested_at: datetime
+    approved_by: Optional[str]
+    approved_at: Optional[datetime]
+    rejected_by: Optional[str]
+    rejected_at: Optional[datetime]
+    notes: Optional[str]
+
+    @classmethod
+    def build(cls, a: RenewalApproval) -> "ApprovalOut":
+        return cls(
+            id=a.id,
+            certificate_id=a.certificate_id,
+            expiration_window_key=a.expiration_window_key,
+            status=a.status.value,
+            requested_by=a.requested_by,
+            requested_at=a.requested_at,
+            approved_by=a.approved_by,
+            approved_at=a.approved_at,
+            rejected_by=a.rejected_by,
+            rejected_at=a.rejected_at,
+            notes=a.notes,
+        )
 
 
 class PolicyOut(BaseModel):
     certificate_id: str
     tenant_id: str
     auto_renew_enabled: bool
+    renewal_mode: str
     enabled_by: Optional[str]
     enabled_at: Optional[datetime]
     disabled_by: Optional[str]
@@ -111,6 +161,7 @@ class PolicyOut(BaseModel):
             certificate_id=pol.certificate_id,
             tenant_id=pol.tenant_id,
             auto_renew_enabled=pol.auto_renew_enabled,
+            renewal_mode=pol.renewal_mode.value,
             enabled_by=pol.enabled_by,
             enabled_at=pol.enabled_at,
             disabled_by=pol.disabled_by,
@@ -217,6 +268,7 @@ def enable_renewal(
         certificate=cert,
         actor=actor,
         renewal_window_days=body.renewal_window_days,
+        renewal_mode=body.renewal_mode,
         config=svc.config,
     )
     svc.policies.save(pol)
@@ -252,6 +304,8 @@ def patch_policy(
         raise HTTPException(status_code=404, detail="No renewal policy exists")
     if body.renewal_window_days is not None:
         pol.renewal_window_days = body.renewal_window_days
+    if body.renewal_mode is not None:
+        pol.renewal_mode = body.renewal_mode
     if body.dry_run_override is not None:
         pol.dry_run_override = body.dry_run_override
     if body.max_attempts is not None:
@@ -298,4 +352,80 @@ def trigger_renewal(
         raise HTTPException(status_code=404, detail=str(exc))
     except RenewalSkipped as exc:
         raise HTTPException(status_code=429, detail=str(exc))
+    except ApprovalPending as exc:
+        # Not an error: the renewal now awaits a human decision.
+        raise HTTPException(status_code=202, detail=str(exc))
     return AttemptOut.build(attempt)
+
+
+# ------------------------------------------------------------------
+# Approvals (APPROVAL_REQUIRED mode)
+# ------------------------------------------------------------------
+
+
+def _approvals_or_501(svc: Services) -> ApprovalRepository:
+    if svc.approvals is None:
+        raise HTTPException(
+            status_code=501,
+            detail="Approvals are not wired: provide Services.approvals "
+                   "(e.g. SqlApprovalRepository) to use approval_required mode.",
+        )
+    return svc.approvals
+
+
+@router.get("/tenants/{tenant_id}/renewal-approvals", response_model=list[ApprovalOut])
+def list_pending_approvals(
+    tenant_id: str,
+    svc: Services = Depends(get_services),
+    actor: str = Depends(get_actor),
+):
+    authorize_tenant(tenant_id, actor)
+    repo = _approvals_or_501(svc)
+    return [ApprovalOut.build(a) for a in repo.list_pending_for_tenant(tenant_id)]
+
+
+@router.post(
+    "/tenants/{tenant_id}/renewal-approvals/{approval_id}/approve",
+    response_model=AttemptOut,
+)
+def approve_renewal(
+    tenant_id: str, approval_id: str, body: ApprovalDecision,
+    svc: Services = Depends(get_services),
+    actor: str = Depends(get_actor),
+):
+    """Approve and immediately run the renewal (opt-in still enforced)."""
+    authorize_tenant(tenant_id, actor)
+    _approvals_or_501(svc)
+    try:
+        attempt = svc.engine.approve_renewal(
+            tenant_id, approval_id, actor=actor, notes=body.notes
+        )
+    except policy_mod.TenantScopeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except policy_mod.OptInRequiredError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RenewalSkipped as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return AttemptOut.build(attempt)
+
+
+@router.post(
+    "/tenants/{tenant_id}/renewal-approvals/{approval_id}/reject",
+    response_model=ApprovalOut,
+)
+def reject_renewal(
+    tenant_id: str, approval_id: str, body: ApprovalDecision,
+    svc: Services = Depends(get_services),
+    actor: str = Depends(get_actor),
+):
+    authorize_tenant(tenant_id, actor)
+    _approvals_or_501(svc)
+    try:
+        approval = svc.engine.reject_renewal(
+            tenant_id, approval_id, actor=actor, notes=body.notes
+        )
+    except policy_mod.TenantScopeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RenewalSkipped as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return ApprovalOut.build(approval)

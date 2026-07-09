@@ -17,6 +17,8 @@
  *   onEnable(windowDays)  -> Promise   PUT .../renewal/enable
  *   onDisable()           -> Promise   PUT .../renewal/disable
  *   onUpdateWindow(days)  -> Promise   PATCH .../renewal
+ *   onUpdateMode(mode)    -> Promise   PATCH .../renewal {renewal_mode} (optional)
+ *                             mode: "automatic" | "approval_required"
  *   onTriggerNow()        -> Promise   POST .../renewal/trigger  (optional)
  *
  * The parent owns data fetching and refetches renewalState after each
@@ -209,6 +211,7 @@ export default function CertificateRenewalPanel({
   onEnable,
   onDisable,
   onUpdateWindow,
+  onUpdateMode,
   onTriggerNow,
 }) {
   const policy = renewalState?.policy;
@@ -361,6 +364,54 @@ export default function CertificateRenewalPanel({
           </div>
         </div>
       </div>
+
+      {/* Renewal mode: fully automatic vs human approval per cycle */}
+      {enabled && onUpdateMode && (
+        <div
+          style={{
+            background: palette.panelBg,
+            borderRadius: 10,
+            padding: "12px 14px",
+            marginBottom: 16,
+          }}
+        >
+          <SectionLabel>Renewal mode</SectionLabel>
+          <div style={{ display: "flex", gap: 8 }}>
+            {[
+              ["automatic", "Automatic"],
+              ["approval_required", "Require approval"],
+            ].map(([value, label]) => {
+              const active = (policy.renewalMode || "automatic") === value;
+              return (
+                <button
+                  key={value}
+                  type="button"
+                  disabled={busy || active}
+                  onClick={() => run(() => onUpdateMode(value))}
+                  style={{
+                    padding: "6px 12px",
+                    borderRadius: 999,
+                    fontSize: 13,
+                    fontWeight: 600,
+                    cursor: busy || active ? "default" : "pointer",
+                    border: `1px solid ${active ? palette.blue : palette.border}`,
+                    background: active ? palette.blueBg : "#fff",
+                    color: active ? palette.blue : palette.textSoft,
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+          {(policy.renewalMode || "automatic") === "approval_required" && (
+            <div style={{ fontSize: 12, color: palette.textSoft, marginTop: 8 }}>
+              Each renewal cycle pauses until someone approves it in the
+              renewal approvals queue.
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Manual trigger */}
       {enabled && onTriggerNow && (

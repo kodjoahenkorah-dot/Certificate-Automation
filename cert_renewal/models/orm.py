@@ -27,12 +27,19 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from cert_renewal.models.domain import (
+    ApprovalStatus,
     AttemptStatus,
+    RenewalApproval,
     RenewalAttempt,
     RenewalMethod,
+    RenewalMode,
     RenewalPolicy,
 )
-from cert_renewal.repository import AttemptRepository, PolicyRepository
+from cert_renewal.repository import (
+    ApprovalRepository,
+    AttemptRepository,
+    PolicyRepository,
+)
 
 
 class Base(DeclarativeBase):
@@ -49,6 +56,9 @@ class RenewalPolicyRow(Base):
     tenant_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     certificate_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
     auto_renew_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    renewal_mode: Mapped[str] = mapped_column(
+        String(32), default=RenewalMode.AUTOMATIC.value, nullable=False
+    )
     enabled_by: Mapped[Optional[str]] = mapped_column(String(256))
     enabled_at: Mapped[Optional[object]] = mapped_column(DateTime(timezone=True))
     disabled_by: Mapped[Optional[str]] = mapped_column(String(256))
@@ -64,6 +74,7 @@ class RenewalPolicyRow(Base):
             certificate_id=self.certificate_id,
             tenant_id=self.tenant_id,
             auto_renew_enabled=self.auto_renew_enabled,
+            renewal_mode=RenewalMode(self.renewal_mode),
             enabled_by=self.enabled_by,
             enabled_at=self.enabled_at,
             disabled_by=self.disabled_by,
@@ -77,6 +88,7 @@ class RenewalPolicyRow(Base):
 
     def apply(self, p: RenewalPolicy) -> None:
         self.auto_renew_enabled = p.auto_renew_enabled
+        self.renewal_mode = p.renewal_mode.value
         self.enabled_by = p.enabled_by
         self.enabled_at = p.enabled_at
         self.disabled_by = p.disabled_by
@@ -98,6 +110,7 @@ class RenewalAttemptRow(Base):
     method: Mapped[Optional[str]] = mapped_column(String(32))
     dry_run: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     attempt_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    expiration_window_key: Mapped[Optional[str]] = mapped_column(String(32), index=True)
     triggered_by: Mapped[str] = mapped_column(String(256), default="scheduler")
     started_at: Mapped[object] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
     finished_at: Mapped[Optional[object]] = mapped_column(DateTime(timezone=True))
@@ -117,6 +130,7 @@ class RenewalAttemptRow(Base):
             method=a.method.value if a.method else None,
             dry_run=a.dry_run,
             attempt_number=a.attempt_number,
+            expiration_window_key=a.expiration_window_key,
             triggered_by=a.triggered_by,
             started_at=a.started_at,
             finished_at=a.finished_at,
@@ -136,6 +150,7 @@ class RenewalAttemptRow(Base):
             method=RenewalMethod(self.method) if self.method else None,
             dry_run=self.dry_run,
             attempt_number=self.attempt_number,
+            expiration_window_key=self.expiration_window_key,
             triggered_by=self.triggered_by,
             started_at=self.started_at,
             finished_at=self.finished_at,
@@ -144,6 +159,62 @@ class RenewalAttemptRow(Base):
             error=self.error,
             work_item_id=self.work_item_id,
             detail=self.detail,
+        )
+
+
+class RenewalApprovalRow(Base):
+    __tablename__ = "cert_renewal_approvals"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "certificate_id", "expiration_window_key",
+            name="uq_approval_tenant_cert_window",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    certificate_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    expiration_window_key: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(256), default="scheduler")
+    requested_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False)
+    approved_by: Mapped[Optional[str]] = mapped_column(String(256))
+    approved_at: Mapped[Optional[object]] = mapped_column(DateTime(timezone=True))
+    rejected_by: Mapped[Optional[str]] = mapped_column(String(256))
+    rejected_at: Mapped[Optional[object]] = mapped_column(DateTime(timezone=True))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    @classmethod
+    def from_domain(cls, a: RenewalApproval) -> "RenewalApprovalRow":
+        return cls(
+            id=a.id,
+            tenant_id=a.tenant_id,
+            certificate_id=a.certificate_id,
+            expiration_window_key=a.expiration_window_key,
+            status=a.status.value,
+            requested_by=a.requested_by,
+            requested_at=a.requested_at,
+            approved_by=a.approved_by,
+            approved_at=a.approved_at,
+            rejected_by=a.rejected_by,
+            rejected_at=a.rejected_at,
+            notes=a.notes,
+        )
+
+    def to_domain(self) -> RenewalApproval:
+        return RenewalApproval(
+            id=self.id,
+            tenant_id=self.tenant_id,
+            certificate_id=self.certificate_id,
+            expiration_window_key=self.expiration_window_key,
+            status=ApprovalStatus(self.status),
+            requested_by=self.requested_by,
+            requested_at=self.requested_at,
+            approved_by=self.approved_by,
+            approved_at=self.approved_at,
+            rejected_by=self.rejected_by,
+            rejected_at=self.rejected_at,
+            notes=self.notes,
         )
 
 
@@ -244,3 +315,69 @@ class SqlAttemptRepository(AttemptRepository):
             else:
                 streak.append(row.to_domain())
         return streak
+
+    def find_work_item_for_window(
+        self, tenant_id: str, certificate_id: str, expiration_window_key: str
+    ) -> Optional[str]:
+        with self._session_factory() as s:
+            row = s.scalars(
+                select(RenewalAttemptRow)
+                .where(
+                    RenewalAttemptRow.tenant_id == tenant_id,
+                    RenewalAttemptRow.certificate_id == certificate_id,
+                    RenewalAttemptRow.expiration_window_key == expiration_window_key,
+                    RenewalAttemptRow.work_item_id.is_not(None),
+                )
+                .order_by(RenewalAttemptRow.started_at.desc())
+                .limit(1)
+            ).first()
+            return row.work_item_id if row else None
+
+
+class SqlApprovalRepository(ApprovalRepository):
+    def __init__(self, session_factory):
+        self._session_factory = session_factory
+
+    def get(self, tenant_id: str, approval_id: str) -> Optional[RenewalApproval]:
+        with self._session_factory() as s:
+            row = s.get(RenewalApprovalRow, approval_id)
+            if row is None or row.tenant_id != tenant_id:
+                return None
+            return row.to_domain()
+
+    def find_for_window(
+        self, tenant_id: str, certificate_id: str, expiration_window_key: str
+    ) -> Optional[RenewalApproval]:
+        with self._session_factory() as s:
+            row = s.scalars(
+                select(RenewalApprovalRow)
+                .where(
+                    RenewalApprovalRow.tenant_id == tenant_id,
+                    RenewalApprovalRow.certificate_id == certificate_id,
+                    RenewalApprovalRow.expiration_window_key == expiration_window_key,
+                )
+                .order_by(RenewalApprovalRow.requested_at.desc())
+                .limit(1)
+            ).first()
+            return row.to_domain() if row else None
+
+    def save(self, approval: RenewalApproval) -> None:
+        with self._session_factory() as s:
+            existing = s.get(RenewalApprovalRow, approval.id)
+            if existing is None:
+                s.add(RenewalApprovalRow.from_domain(approval))
+            else:
+                fresh = RenewalApprovalRow.from_domain(approval)
+                for col in RenewalApprovalRow.__table__.columns.keys():
+                    setattr(existing, col, getattr(fresh, col))
+            s.commit()
+
+    def list_pending_for_tenant(self, tenant_id: str) -> list[RenewalApproval]:
+        with self._session_factory() as s:
+            rows = s.scalars(
+                select(RenewalApprovalRow).where(
+                    RenewalApprovalRow.tenant_id == tenant_id,
+                    RenewalApprovalRow.status == ApprovalStatus.PENDING.value,
+                )
+            ).all()
+            return [r.to_domain() for r in rows]

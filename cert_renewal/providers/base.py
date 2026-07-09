@@ -14,6 +14,8 @@ import abc
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from typing import Optional as _Optional
+
 from cert_renewal.config import RenewalConfig
 from cert_renewal.models.domain import Certificate, RenewalResult
 
@@ -36,3 +38,13 @@ class RenewalProvider(abc.ABC):
     @abc.abstractmethod
     def renew(self, cert: Certificate, ctx: ProviderContext) -> RenewalResult:
         ...
+
+    def verify(
+        self, cert: Certificate, result: RenewalResult, ctx: ProviderContext
+    ) -> _Optional[str]:
+        """Post-renewal check, called by the engine after a live (non-dry-run)
+        SUCCEEDED result: re-read the renewed resource and confirm the new
+        expiry actually took. Return None when verified, or an error string —
+        the engine then records the attempt as FAILED instead of trusting the
+        renew() result. Default: no verification."""
+        return None

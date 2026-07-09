@@ -103,3 +103,25 @@ class AppServiceRenewalProvider(RenewalProvider):
             new_thumbprint=thumbprint,
             detail=f"Managed certificate re-issued for {canonical}.",
         )
+
+    def verify(self, cert: Certificate, result, ctx: ProviderContext):
+        """Re-read the certificate resource and confirm Azure reports the
+        new expiry before the engine records success."""
+        from azure.mgmt.web import WebSiteManagementClient
+
+        client = WebSiteManagementClient(
+            credential=ctx.azure_credential,
+            subscription_id=ctx.azure_subscription_id,
+        )
+        resource = client.certificates.get(
+            cert.azure_resource_group, cert.app_service_cert_name
+        )
+        expires_on = getattr(resource, "expiration_date", None)
+        if expires_on and expires_on.tzinfo is None:
+            expires_on = expires_on.replace(tzinfo=timezone.utc)
+        if not expires_on or expires_on <= cert.expires_at:
+            return (
+                f"Azure still reports expiry {expires_on} "
+                f"(previous expiry {cert.expires_at})."
+            )
+        return None

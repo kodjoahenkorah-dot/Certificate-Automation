@@ -16,6 +16,7 @@ from cert_renewal.models.domain import (
     AttemptStatus,
     Certificate,
     RenewalResult,
+    expiration_window_key,
 )
 from cert_renewal.providers.base import ProviderContext, RenewalProvider
 from cert_renewal.work_items import (
@@ -53,6 +54,7 @@ class ManualFallbackProvider(RenewalProvider):
                 severity=severity,
                 assignee_email=cert.owner_email,
                 certificate_id=cert.id,
+                idempotency_key=f"{cert.id}:{expiration_window_key(cert)}",
             )
         )
         return RenewalResult(

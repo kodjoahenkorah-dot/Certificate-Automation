@@ -15,6 +15,7 @@ from cert_renewal.config import RenewalConfig
 from cert_renewal.models.domain import (
     Certificate,
     RenewalAttempt,
+    RenewalMode,
     RenewalPolicy,
     utcnow,
 )
@@ -67,6 +68,7 @@ def enable_auto_renewal(
     certificate: Certificate,
     actor: str,
     renewal_window_days: Optional[int] = None,
+    renewal_mode: Optional[RenewalMode] = None,
     config: Optional[RenewalConfig] = None,
     now: Optional[datetime] = None,
 ) -> RenewalPolicy:
@@ -101,6 +103,8 @@ def enable_auto_renewal(
     policy.enabled_by = actor.strip()
     policy.enabled_at = now
     policy.renewal_window_days = window
+    if renewal_mode is not None:
+        policy.renewal_mode = renewal_mode
     policy.updated_at = now
     return policy
 

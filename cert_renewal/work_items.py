@@ -27,6 +27,10 @@ class WorkItemRequest:
     severity: str = "high"                 # matches product severity pills
     assignee_email: Optional[str] = None   # cert owner; None => Unassigned
     certificate_id: Optional[str] = None
+    # "<certificate_id>:<expiration_window_key>". The engine already
+    # deduplicates via the audit log; implementations that upsert on this key
+    # get a second layer of protection (e.g. across data restores).
+    idempotency_key: Optional[str] = None
     labels: list[str] = field(default_factory=lambda: ["certificate-renewal"])
 
 

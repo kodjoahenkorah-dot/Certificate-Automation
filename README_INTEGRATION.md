@@ -30,6 +30,19 @@ interface.
    manual — is a `cert_renewal_attempts` row with status, timestamps, new
    expiry/thumbprint on success, error text on failure, and the Work Item
    id when one was created.
+5. **Optional human-in-the-loop mode.** A policy can be set to
+   `renewal_mode = approval_required`: the sweep then creates one
+   `RenewalApproval` per expiry window and pauses; renewal runs only after a
+   user approves it (approve/reject endpoints record who and when). `force`
+   cannot bypass this gate.
+6. **Idempotent per expiry window.** Approvals and fallback Work Items are
+   deduplicated on (tenant, certificate, current-expiry-date), so repeated
+   sweeps can never create duplicates within one renewal cycle. A successful
+   renewal changes the expiry and naturally opens a new window.
+7. **Trust-but-verify.** After a live renewal reports success, the engine
+   calls the provider's `verify()` hook, which re-reads the resource from
+   Azure and confirms the new expiry actually took; a failed verification is
+   recorded as a FAILED attempt and the certificates table is not updated.
 
 ## Architecture
 
@@ -99,7 +112,7 @@ cert_renewal/
   api.py               FastAPI router                          [optional]
 frontend/
   CertificateRenewalPanel.jsx
-tests/                 61 unit tests (pure Python, no cloud deps)
+tests/                 75 unit tests (pure Python, no cloud deps)
 ```
 
 Install: `pip install .` gives the dependency-free core. Extras:
@@ -125,14 +138,17 @@ Implement `repository.CertRepository` over your existing certificates table
 - `update_after_renewal()` writes the new expiry/thumbprint back so the UI
   and the "expiring ≤ 30 days" counters update before the next full scan.
 
-### 2. New tables → `PolicyRepository` / `AttemptRepository`
+### 2. New tables → `PolicyRepository` / `AttemptRepository` / `ApprovalRepository`
 
 Use the provided SQLAlchemy implementation (`models/orm.py`:
-`cert_renewal_policies`, `cert_renewal_attempts`;
+`cert_renewal_policies`, `cert_renewal_attempts`, `cert_renewal_approvals`;
 `Base.metadata.create_all(engine)` or generate an Alembic migration), or
-implement the two ports over your own ORM. `cert_renewal_policies` is
-unique on (tenant_id, certificate_id); `cert_renewal_attempts` is
-append-mostly (status transitions update the same row id).
+implement the ports over your own ORM. `cert_renewal_policies` is unique on
+(tenant_id, certificate_id); `cert_renewal_attempts` is append-mostly
+(status transitions update the same row id); `cert_renewal_approvals` is
+unique on (tenant_id, certificate_id, expiration_window_key). The approvals
+table/repository is only needed if you expose `approval_required` mode —
+the engine defaults to an in-memory store otherwise.
 
 ### 3. Per-tenant Azure credentials → `TenantCredentialResolver`
 
@@ -190,11 +206,15 @@ your RBAC check. Routes:
 
 ```
 GET    /tenants/{t}/certificates/{c}/renewal            policy + last 10 attempts
-PUT    /tenants/{t}/certificates/{c}/renewal/enable     {renewal_window_days?}
+PUT    /tenants/{t}/certificates/{c}/renewal/enable     {renewal_window_days?, renewal_mode?}
 PUT    /tenants/{t}/certificates/{c}/renewal/disable
-PATCH  /tenants/{t}/certificates/{c}/renewal            window/dry-run/max-attempts
+PATCH  /tenants/{t}/certificates/{c}/renewal            window/mode/dry-run/max-attempts
 GET    /tenants/{t}/certificates/{c}/renewal/attempts
-POST   /tenants/{t}/certificates/{c}/renewal/trigger    manual run (opt-in still enforced)
+POST   /tenants/{t}/certificates/{c}/renewal/trigger    manual run (opt-in + approval still enforced;
+                                                        202 when awaiting approval)
+GET    /tenants/{t}/renewal-approvals                   pending approvals queue
+POST   /tenants/{t}/renewal-approvals/{id}/approve      approve + renew immediately
+POST   /tenants/{t}/renewal-approvals/{id}/reject       reject for this expiry window
 ```
 
 ### 8. Frontend
@@ -203,10 +223,11 @@ POST   /tenants/{t}/certificates/{c}/renewal/trigger    manual run (opt-in still
 library) for the certificate row expansion / detail drawer. Pass the
 certificate, the GET response as `renewalState`, and four callbacks that
 hit the routes above (`onEnable`, `onDisable`, `onUpdateWindow`,
-`onTriggerNow`); refetch `renewalState` after each resolves. It shows the
-enable toggle, opt-in provenance ("Enabled by … on …"), a dry-run badge,
-the renewal method, the window input, an urgency banner for expired/≤30-day
-certs, and the attempt history with your pill-badge styling.
+`onTriggerNow`, plus optional `onUpdateMode`); refetch `renewalState` after
+each resolves. It shows the enable toggle, opt-in provenance ("Enabled by …
+on …"), a dry-run badge, the renewal method, the window input, an
+Automatic / Require-approval mode selector, an urgency banner for
+expired/≤30-day certs, and the attempt history with your pill-badge styling.
 
 ### 9. ACME specifics (external Let's Encrypt/ZeroSSL certs only)
 
@@ -255,14 +276,17 @@ If either is missing, external ACME certs safely fall back to Work Items.
    Work Items and notifications look right (still dry-run for providers —
    note dry-run also suppresses Work Item creation, so validate those with
    step 4's pilot).
-4. Go live for one pilot tenant: set `CERT_RENEWAL_DRY_RUN=false` and put
+4. Optionally use `renewal_mode = approval_required` as a stepping stone
+   between dry-run and fully automatic: renewals run live, but each one
+   waits for a human click in the approvals queue first.
+5. Go live for one pilot tenant: set `CERT_RENEWAL_DRY_RUN=false` and put
    **every other tenant** in `CERT_RENEWAL_DRY_RUN_TENANTS`. Set
    `CERT_RENEWAL_MAX_PER_SWEEP=3`. Start with a Key Vault "Self"-issued or
    staging cert.
-5. For ACME, point `CERT_RENEWAL_ACME_DIRECTORY` at Let's Encrypt staging
+6. For ACME, point `CERT_RENEWAL_ACME_DIRECTORY` at Let's Encrypt staging
    first; switch to production only after a staging issuance succeeds
    end-to-end (including installation).
-6. Widen tenant by tenant by shrinking `CERT_RENEWAL_DRY_RUN_TENANTS`;
+7. Widen tenant by tenant by shrinking `CERT_RENEWAL_DRY_RUN_TENANTS`;
    raise or remove the per-sweep cap once confident.
 
 ## Adapting away from the defaults

@@ -44,6 +44,19 @@ class RenewalMethod(str, enum.Enum):
     MANUAL = "manual"            # Work Item assigned to the cert owner
 
 
+class RenewalMode(str, enum.Enum):
+    """How an opted-in certificate is renewed. Only meaningful once
+    auto_renew_enabled is True — a disabled policy is never renewed at all.
+
+    AUTOMATIC        the sweep renews with no human in the loop
+    APPROVAL_REQUIRED the sweep creates a RenewalApproval; renewal runs only
+                      after a user approves it (once per expiry window)
+    """
+
+    AUTOMATIC = "automatic"
+    APPROVAL_REQUIRED = "approval_required"
+
+
 class AttemptStatus(str, enum.Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -108,6 +121,17 @@ class Certificate:
         return self.days_to_expiry(now) <= 0
 
 
+def expiration_window_key(cert: Certificate) -> str:
+    """Identifies one renewal cycle: the certificate's current expiry date.
+
+    Approvals and fallback Work Items are deduplicated on
+    (tenant, certificate, window key), so repeated sweeps within the same
+    cycle can never create duplicates. A successful renewal changes the
+    expiry and therefore starts a fresh window automatically.
+    """
+    return cert.expires_at.date().isoformat()
+
+
 @dataclass
 class RenewalPolicy:
     """Per-certificate opt-in record. THE default is auto_renew_enabled=False.
@@ -119,6 +143,7 @@ class RenewalPolicy:
     certificate_id: str
     tenant_id: str
     auto_renew_enabled: bool = False
+    renewal_mode: RenewalMode = RenewalMode.AUTOMATIC
     enabled_by: Optional[str] = None      # user identity who opted in
     enabled_at: Optional[datetime] = None
     disabled_by: Optional[str] = None
@@ -145,6 +170,7 @@ class RenewalAttempt:
     method: Optional[RenewalMethod] = None
     dry_run: bool = True
     attempt_number: int = 1               # 1..max_attempts within a renewal cycle
+    expiration_window_key: Optional[str] = None  # see expiration_window_key()
     triggered_by: str = "scheduler"       # "scheduler" or "api:<user identity>"
     started_at: datetime = field(default_factory=utcnow)
     finished_at: Optional[datetime] = None
@@ -155,6 +181,31 @@ class RenewalAttempt:
     error: Optional[str] = None
     work_item_id: Optional[str] = None    # set when a fallback Work Item was created
     detail: Optional[str] = None          # human-readable narrative (esp. dry runs)
+
+
+class ApprovalStatus(str, enum.Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+@dataclass
+class RenewalApproval:
+    """One human sign-off per certificate per expiry window, used when the
+    policy's renewal_mode is APPROVAL_REQUIRED."""
+
+    tenant_id: str
+    certificate_id: str
+    expiration_window_key: str
+    id: str = field(default_factory=new_id)
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    requested_by: str = "scheduler"
+    requested_at: datetime = field(default_factory=utcnow)
+    approved_by: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    rejected_by: Optional[str] = None
+    rejected_at: Optional[datetime] = None
+    notes: Optional[str] = None
 
 
 @dataclass

@@ -27,20 +27,26 @@ from cert_renewal.credentials import (
 )
 from cert_renewal.models.domain import (
     ACME_AUTOMATABLE_ISSUERS,
+    ApprovalStatus,
     AttemptStatus,
     Certificate,
     CertSource,
+    RenewalApproval,
     RenewalAttempt,
     RenewalMethod,
+    RenewalMode,
     RenewalPolicy,
     RenewalResult,
+    expiration_window_key,
     utcnow,
 )
 from cert_renewal.notifications import Notifier
 from cert_renewal.providers.base import ProviderContext, RenewalProvider
 from cert_renewal.repository import (
+    ApprovalRepository,
     AttemptRepository,
     CertRepository,
+    InMemoryApprovalRepository,
     PolicyRepository,
 )
 from cert_renewal.work_items import (
@@ -54,6 +60,16 @@ log = logging.getLogger("cert_renewal.engine")
 
 class RenewalSkipped(Exception):
     """The attempt did not run (retry budget, cooldown). Not an error."""
+
+
+class ApprovalPending(Exception):
+    """The policy requires human approval and none has been granted for the
+    current expiry window. Not an error; the approval (newly created or
+    already open) is attached."""
+
+    def __init__(self, message: str, approval: Optional[RenewalApproval] = None):
+        super().__init__(message)
+        self.approval = approval
 
 
 def select_method(cert: Certificate) -> RenewalMethod:
@@ -87,12 +103,16 @@ class RenewalEngine:
         credentials: TenantCredentialResolver,
         notifier: Notifier,
         work_items: WorkItemSink,
+        approvals: Optional[ApprovalRepository] = None,
         config: Optional[RenewalConfig] = None,
         clock=utcnow,
     ):
         self._certs = certs
         self._policies = policies
         self._attempts = attempts
+        # Approvals only matter for APPROVAL_REQUIRED policies; default to an
+        # in-memory store so purely-automatic deployments need no extra table.
+        self._approvals = approvals or InMemoryApprovalRepository()
         self._providers = providers
         self._credentials = credentials
         self._notifier = notifier
@@ -117,7 +137,8 @@ class RenewalEngine:
         and recorded as a failed attempt.
 
         ``force=True`` (manual API trigger) bypasses the renewal-window and
-        retry-cooldown checks but NEVER the opt-in or tenant-scope gates.
+        retry-cooldown checks but NEVER the opt-in, tenant-scope, or
+        approval gates.
         """
         now = self._clock()
         cert = self._certs.get(tenant_id, certificate_id)
@@ -136,6 +157,9 @@ class RenewalEngine:
                 "renewal window."
             )
 
+        if pol.renewal_mode == RenewalMode.APPROVAL_REQUIRED:
+            self._require_approval(cert, triggered_by, now)
+
         max_attempts = pol.max_attempts or self._config.max_attempts
         retry_interval = timedelta(
             minutes=pol.retry_interval_minutes or self._config.retry_interval_minutes
@@ -153,6 +177,7 @@ class RenewalEngine:
 
         dry_run = policy_mod.effective_dry_run(self._config, pol, tenant_id)
         method = select_method(cert)
+        window_key = expiration_window_key(cert)
 
         attempt = RenewalAttempt(
             tenant_id=tenant_id,
@@ -161,10 +186,29 @@ class RenewalEngine:
             method=method,
             dry_run=dry_run,
             attempt_number=attempt_number,
+            expiration_window_key=window_key,
             triggered_by=triggered_by,
             started_at=now,
         )
         self._attempts.save(attempt)
+
+        # Idempotency: if a Work Item already exists for this expiry window,
+        # the manual path has nothing left to do — reference it and stop
+        # instead of creating a duplicate on every sweep.
+        if method == RenewalMethod.MANUAL and not dry_run:
+            existing = self._attempts.find_work_item_for_window(
+                tenant_id, certificate_id, window_key
+            )
+            if existing:
+                attempt.status = AttemptStatus.MANUAL_REQUIRED
+                attempt.finished_at = self._clock()
+                attempt.work_item_id = existing
+                attempt.detail = (
+                    f"Work Item {existing} already open for this expiry window; "
+                    "no duplicate created."
+                )
+                self._attempts.save(attempt)
+                return attempt
 
         attempt.status = AttemptStatus.IN_PROGRESS
         self._attempts.save(attempt)
@@ -172,6 +216,56 @@ class RenewalEngine:
         result = self._execute(cert, method, dry_run)
         self._finalize(cert, pol, attempt, result, max_attempts)
         return attempt
+
+    def approve_renewal(
+        self, tenant_id: str, approval_id: str, *, actor: str,
+        notes: Optional[str] = None,
+    ) -> RenewalAttempt:
+        """Approve a pending APPROVAL_REQUIRED renewal and run it immediately.
+        The approval covers only the certificate's current expiry window."""
+        if not actor or not actor.strip():
+            raise ValueError("actor is required to approve a renewal")
+        approval = self._approvals.get(tenant_id, approval_id)
+        if approval is None:
+            raise policy_mod.TenantScopeError(
+                f"Approval {approval_id!r} not found in tenant {tenant_id!r}."
+            )
+        if approval.status != ApprovalStatus.PENDING:
+            raise RenewalSkipped(
+                f"Approval {approval_id} is already {approval.status.value}."
+            )
+        approval.status = ApprovalStatus.APPROVED
+        approval.approved_by = actor.strip()
+        approval.approved_at = self._clock()
+        approval.notes = notes or approval.notes
+        self._approvals.save(approval)
+        return self.renew_certificate(
+            tenant_id, approval.certificate_id, triggered_by=f"approval:{actor}"
+        )
+
+    def reject_renewal(
+        self, tenant_id: str, approval_id: str, *, actor: str,
+        notes: Optional[str] = None,
+    ) -> RenewalApproval:
+        """Reject a pending approval. The cert will not be renewed this
+        expiry window unless a user re-triggers and re-approves."""
+        if not actor or not actor.strip():
+            raise ValueError("actor is required to reject a renewal")
+        approval = self._approvals.get(tenant_id, approval_id)
+        if approval is None:
+            raise policy_mod.TenantScopeError(
+                f"Approval {approval_id!r} not found in tenant {tenant_id!r}."
+            )
+        if approval.status != ApprovalStatus.PENDING:
+            raise RenewalSkipped(
+                f"Approval {approval_id} is already {approval.status.value}."
+            )
+        approval.status = ApprovalStatus.REJECTED
+        approval.rejected_by = actor.strip()
+        approval.rejected_at = self._clock()
+        approval.notes = notes or approval.notes
+        self._approvals.save(approval)
+        return approval
 
     def run_due_renewals(self, tenant_id: str) -> list[RenewalAttempt]:
         """One scheduler sweep for one tenant: attempt every opted-in cert
@@ -200,6 +294,8 @@ class RenewalEngine:
                 )
             except RenewalSkipped as exc:
                 log.debug("[tenant=%s] %s: %s", tenant_id, cert.name, exc)
+            except ApprovalPending as exc:
+                log.info("[tenant=%s] %s: %s", tenant_id, cert.name, exc)
             except policy_mod.OptInRequiredError:
                 # Race: policy disabled between listing and attempting.
                 log.info("[tenant=%s] %s no longer opted in; skipped.",
@@ -209,6 +305,45 @@ class RenewalEngine:
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
+
+    def _require_approval(
+        self, cert: Certificate, triggered_by: str, now
+    ) -> None:
+        """Gate for APPROVAL_REQUIRED mode. Proceeds only when an APPROVED
+        approval exists for the cert's current expiry window; otherwise
+        ensures exactly one PENDING approval exists (idempotent per window)
+        and raises ApprovalPending."""
+        window_key = expiration_window_key(cert)
+        approval = self._approvals.find_for_window(
+            cert.tenant_id, cert.id, window_key
+        )
+        if approval is not None and approval.status == ApprovalStatus.APPROVED:
+            return
+        if approval is not None and approval.status == ApprovalStatus.PENDING:
+            raise ApprovalPending(
+                f"Renewal of {cert.name} awaits approval "
+                f"(approval {approval.id}, window {window_key}).",
+                approval,
+            )
+        if approval is not None and approval.status == ApprovalStatus.REJECTED:
+            raise ApprovalPending(
+                f"Renewal of {cert.name} was rejected by "
+                f"{approval.rejected_by} for window {window_key}; not retrying.",
+                approval,
+            )
+        approval = RenewalApproval(
+            tenant_id=cert.tenant_id,
+            certificate_id=cert.id,
+            expiration_window_key=window_key,
+            requested_by=triggered_by,
+            requested_at=now,
+        )
+        self._approvals.save(approval)
+        raise ApprovalPending(
+            f"Renewal of {cert.name} requires approval; created approval "
+            f"{approval.id} for window {window_key}.",
+            approval,
+        )
 
     def _execute(
         self, cert: Certificate, method: RenewalMethod, dry_run: bool
@@ -224,7 +359,19 @@ class RenewalEngine:
         except CredentialNotConfiguredError as exc:
             return RenewalResult(status=AttemptStatus.FAILED, error=str(exc))
         try:
-            return provider.renew(cert, ctx)
+            result = provider.renew(cert, ctx)
+            # Trust-but-verify: a live success must survive the provider's
+            # own re-read of the renewed resource before we record it.
+            if result.status == AttemptStatus.SUCCEEDED and not dry_run:
+                verify_error = provider.verify(cert, result, ctx)
+                if verify_error:
+                    return RenewalResult(
+                        status=AttemptStatus.FAILED,
+                        error=f"Renewal reported success but verification "
+                              f"failed: {verify_error}",
+                        detail=result.detail,
+                    )
+            return result
         except Exception as exc:  # provider bugs/timeouts become failed attempts
             log.exception(
                 "[tenant=%s] Provider %s raised for cert %s",
@@ -301,6 +448,12 @@ class RenewalEngine:
         self._notify(cert, attempt)
 
     def _create_fallback_work_item(self, cert: Certificate, *, reason: str) -> str:
+        window_key = expiration_window_key(cert)
+        existing = self._attempts.find_work_item_for_window(
+            cert.tenant_id, cert.id, window_key
+        )
+        if existing:
+            return existing
         return self._work_items.create(
             WorkItemRequest(
                 tenant_id=cert.tenant_id,
@@ -309,6 +462,7 @@ class RenewalEngine:
                 severity="critical" if cert.is_expired(self._clock()) else "high",
                 assignee_email=cert.owner_email,
                 certificate_id=cert.id,
+                idempotency_key=f"{cert.id}:{window_key}",
             )
         )
 

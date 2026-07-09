@@ -17,7 +17,9 @@ from dataclasses import replace
 from typing import Optional
 
 from cert_renewal.models.domain import (
+    ApprovalStatus,
     Certificate,
+    RenewalApproval,
     RenewalAttempt,
     RenewalPolicy,
 )
@@ -73,6 +75,35 @@ class AttemptRepository(abc.ABC):
     ) -> list[RenewalAttempt]:
         """Terminal, non-dry-run attempts after the latest SUCCEEDED one
         (i.e. the current failure streak). Used for retry budgeting."""
+
+    @abc.abstractmethod
+    def find_work_item_for_window(
+        self, tenant_id: str, certificate_id: str, expiration_window_key: str
+    ) -> Optional[str]:
+        """Id of a Work Item already created for this cert in this expiry
+        window, if any. Used to deduplicate manual-fallback Work Items."""
+
+
+class ApprovalRepository(abc.ABC):
+    """Persistence for APPROVAL_REQUIRED-mode sign-offs."""
+
+    @abc.abstractmethod
+    def get(self, tenant_id: str, approval_id: str) -> Optional[RenewalApproval]:
+        ...
+
+    @abc.abstractmethod
+    def find_for_window(
+        self, tenant_id: str, certificate_id: str, expiration_window_key: str
+    ) -> Optional[RenewalApproval]:
+        """Most recent approval for this cert + window, any status."""
+
+    @abc.abstractmethod
+    def save(self, approval: RenewalApproval) -> None:
+        ...
+
+    @abc.abstractmethod
+    def list_pending_for_tenant(self, tenant_id: str) -> list[RenewalApproval]:
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -179,3 +210,56 @@ class InMemoryAttemptRepository(AttemptRepository):
             else:
                 streak.append(a)
         return streak
+
+    def find_work_item_for_window(
+        self, tenant_id: str, certificate_id: str, expiration_window_key: str
+    ) -> Optional[str]:
+        rows = sorted(
+            self._for_cert(tenant_id, certificate_id),
+            key=lambda a: a.started_at,
+            reverse=True,
+        )
+        for a in rows:
+            if (
+                a.work_item_id
+                and a.expiration_window_key == expiration_window_key
+            ):
+                return a.work_item_id
+        return None
+
+
+class InMemoryApprovalRepository(ApprovalRepository):
+    def __init__(self):
+        self._approvals: dict[str, RenewalApproval] = {}
+        self._lock = threading.Lock()
+
+    def get(self, tenant_id: str, approval_id: str) -> Optional[RenewalApproval]:
+        approval = self._approvals.get(approval_id)
+        if approval is None or approval.tenant_id != tenant_id:
+            return None
+        return approval
+
+    def find_for_window(
+        self, tenant_id: str, certificate_id: str, expiration_window_key: str
+    ) -> Optional[RenewalApproval]:
+        matches = [
+            a
+            for a in self._approvals.values()
+            if a.tenant_id == tenant_id
+            and a.certificate_id == certificate_id
+            and a.expiration_window_key == expiration_window_key
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda a: a.requested_at)
+
+    def save(self, approval: RenewalApproval) -> None:
+        with self._lock:
+            self._approvals[approval.id] = approval
+
+    def list_pending_for_tenant(self, tenant_id: str) -> list[RenewalApproval]:
+        return [
+            a
+            for a in self._approvals.values()
+            if a.tenant_id == tenant_id and a.status == ApprovalStatus.PENDING
+        ]

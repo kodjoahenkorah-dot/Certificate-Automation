@@ -24,6 +24,7 @@ from cert_renewal.notifications import Notifier
 from cert_renewal.providers.base import ProviderContext, RenewalProvider
 from cert_renewal.providers.manual import ManualFallbackProvider
 from cert_renewal.repository import (
+    InMemoryApprovalRepository,
     InMemoryAttemptRepository,
     InMemoryCertRepository,
     InMemoryPolicyRepository,
@@ -55,12 +56,18 @@ class FakeProvider(RenewalProvider):
         )
         self.calls: list[tuple[Certificate, ProviderContext]] = []
         self.raise_exc: Exception | None = None
+        self.verify_error: str | None = None
+        self.verify_calls = 0
 
     def renew(self, cert: Certificate, ctx: ProviderContext) -> RenewalResult:
         self.calls.append((cert, ctx))
         if self.raise_exc:
             raise self.raise_exc
         return self.result
+
+    def verify(self, cert, result, ctx):
+        self.verify_calls += 1
+        return self.verify_error
 
 
 class FakeCredentials(TenantCredentialResolver):
@@ -164,12 +171,18 @@ def config():
 
 
 @pytest.fixture
-def engine(certs, policies, attempts, work_items, notifier, credentials,
-           fake_kv_provider, config, clock):
+def approvals():
+    return InMemoryApprovalRepository()
+
+
+@pytest.fixture
+def engine(certs, policies, attempts, approvals, work_items, notifier,
+           credentials, fake_kv_provider, config, clock):
     return RenewalEngine(
         certs=certs,
         policies=policies,
         attempts=attempts,
+        approvals=approvals,
         providers={
             RenewalMethod.KEY_VAULT: fake_kv_provider,
             RenewalMethod.APP_SERVICE: FakeProvider(),
