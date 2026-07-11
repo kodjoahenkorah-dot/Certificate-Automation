@@ -1,9 +1,3 @@
-__pycache__/
-*.pyc
-.pytest_cache/
-dist/
-*.egg-info/
-dotnet/bin/
-dotnet/obj/
-**/bin/
-**/obj/
+dotnet/**/bin/
+dotnet/**/obj/
+node_modules/

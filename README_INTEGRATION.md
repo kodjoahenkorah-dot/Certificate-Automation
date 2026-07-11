@@ -7,11 +7,6 @@ coupling: the core engine (`CertRenewal.Core`) has no cloud, EF, or ASP.NET
 dependencies, and every touchpoint with the existing product is an explicit,
 documented interface.
 
-> A Python reference implementation with identical semantics lives in
-> `cert_renewal/` + `tests/` (75 passing pytest tests). It predates the .NET
-> port and is kept for cross-checking behavior; **the `dotnet/` solution and
-> `frontend/CertificateRenewalPanel.tsx` are the deliverable to integrate.**
-
 ## Safety properties (read this first)
 
 1. **Auto-renew is OFF by default, everywhere.** A certificate with no policy
@@ -113,11 +108,13 @@ dotnet/
                                     ports, Azure DNS DNS-01 solver
   src/CertRenewal.EntityFramework/  EF Core entities + DbContext + repos
   src/CertRenewal.Api/              minimal-API endpoints, IActorResolver,
-                                    optional sweep BackgroundService
+                                    optional sweep BackgroundService,
+                                    appsettings.example.json
   tests/CertRenewal.Core.Tests/     81 xUnit tests (no cloud deps)
+  migrations/                       plain-SQL alternative to EF migrations
 frontend/
-  CertificateRenewalPanel.tsx       Next.js client component
-cert_renewal/ + tests/              Python reference implementation
+  CertificateRenewalPanel.tsx       Next.js "use client" component
+  renewalApi.ts                     typed client for the API endpoints
 ```
 
 Build & test: `cd dotnet && dotnet build CertRenewal.sln && dotnet test`.
@@ -150,7 +147,9 @@ Three new tables; the existing certificates table is NOT duplicated:
 Either merge the entity configurations from `CertRenewalDbContext` into your
 existing DbContext, or run the context side-by-side on the same database and
 generate a migration
-(`dotnet ef migrations add CertRenewal --context CertRenewalDbContext`).
+(`dotnet ef migrations add CertRenewal --context CertRenewalDbContext`), or
+apply `dotnet/migrations/001_cert_renewal_tables.sql` directly (PostgreSQL
+syntax; adapt types for SQL Server).
 The `Ef*Repository` classes take `IDbContextFactory<CertRenewalDbContext>`
 so they are safe to inject into singletons. If you'd rather use your own
 data layer, implement the four small interfaces in
@@ -246,10 +245,13 @@ POST   /api/v1/tenants/{t}/renewal-approvals/{id}/reject       reject for this e
 
 `frontend/CertificateRenewalPanel.tsx` is a fully typed, self-contained
 `"use client"` component (no UI library) for the certificate row expansion /
-detail drawer. Pass the certificate, the GET response as `renewalState`, and
-callbacks that hit the routes above (`onEnable`, `onDisable`,
-`onUpdateWindow`, optional `onUpdateMode`, `onTriggerNow`); refetch
-`renewalState` after each resolves. It shows the enable toggle, opt-in
+detail drawer, and `frontend/renewalApi.ts` is a typed fetch client for the
+routes above (set `NEXT_PUBLIC_CLEAR_OPS_API_BASE_URL`, and replace its
+default headers together with `IActorResolver` when wiring real auth). Pass
+the certificate, the GET response as `renewalState`, and callbacks built on
+the client (`onEnable`, `onDisable`, `onUpdateWindow`, optional
+`onUpdateMode`, `onTriggerNow`); refetch `renewalState` after each resolves —
+the wiring example is at the top of `renewalApi.ts`. It shows the enable toggle, opt-in
 provenance ("Enabled by … on …"), a dry-run badge, the renewal method, the
 window input, an Automatic / Require-approval mode selector, an urgency
 banner for expired/≤30-day certs, and the attempt history with the product's
@@ -292,7 +294,8 @@ If either is missing, external ACME certs safely fall back to Work Items.
 | `CERT_RENEWAL_TENANT_<ID>_*` | *(unset)* | Dev-only credentials for `EnvTenantCredentialResolver`. |
 
 `RenewalOptions` can also be bound from `IConfiguration` (section
-`CertRenewal`) instead of environment variables.
+`CertRenewal`) instead of environment variables — see
+`src/CertRenewal.Api/appsettings.example.json`.
 
 ## Recommended rollout (dry-run first)
 
