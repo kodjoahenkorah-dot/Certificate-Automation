@@ -1,5 +1,6 @@
 using CertRenewal.Core.Models;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 namespace CertRenewal.EntityFramework;
 
@@ -48,6 +49,25 @@ public sealed class CertRenewalDbContext(DbContextOptions<CertRenewalDbContext> 
             e.HasIndex(a => new { a.TenantId, a.CertificateId, a.ExpirationWindowKey }).IsUnique();
             e.Property(a => a.Status).HasConversion<string>().HasMaxLength(16);
         });
+
+        // SQLite (used in tests / local dev) cannot order by DateTimeOffset;
+        // store as ticks there. SQL Server / PostgreSQL are unaffected.
+        if (Database.ProviderName?.Contains("Sqlite", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            foreach (var entity in modelBuilder.Model.GetEntityTypes())
+            foreach (var property in entity.GetProperties())
+            {
+                // UtcTicks keeps ordering correct regardless of offset.
+                if (property.ClrType == typeof(DateTimeOffset))
+                    property.SetValueConverter(new ValueConverter<DateTimeOffset, long>(
+                        v => v.UtcTicks,
+                        v => new DateTimeOffset(v, TimeSpan.Zero)));
+                else if (property.ClrType == typeof(DateTimeOffset?))
+                    property.SetValueConverter(new ValueConverter<DateTimeOffset?, long?>(
+                        v => v.HasValue ? v.Value.UtcTicks : null,
+                        v => v.HasValue ? new DateTimeOffset(v.Value, TimeSpan.Zero) : null));
+            }
+        }
     }
 }
 

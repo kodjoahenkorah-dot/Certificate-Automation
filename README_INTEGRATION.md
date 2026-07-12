@@ -111,6 +111,7 @@ dotnet/
                                     optional sweep BackgroundService,
                                     appsettings.example.json
   tests/CertRenewal.Core.Tests/     81 xUnit tests (no cloud deps)
+  tests/CertRenewal.EntityFramework.Tests/  4 EF smoke tests (SQLite)
   migrations/                       plain-SQL alternative to EF migrations
 frontend/
   CertificateRenewalPanel.tsx       Next.js "use client" component

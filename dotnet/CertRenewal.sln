@@ -1,4 +1,4 @@
-Microsoft Visual Studio Solution File, Format Version 12.00
+﻿Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CertRenewal.Core", "src\CertRenewal.Core\CertRenewal.Core.csproj", "{1A000000-0000-0000-0000-000000000001}"
 EndProject
@@ -11,6 +11,10 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CertRenewal.Api", "src\CertRenewal.Api\CertRenewal.Api.csproj", "{1A000000-0000-0000-0000-000000000005}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CertRenewal.Core.Tests", "tests\CertRenewal.Core.Tests\CertRenewal.Core.Tests.csproj", "{1A000000-0000-0000-0000-000000000006}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{281FFA43-F370-49BC-BCF9-54A599017FAE}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CertRenewal.EntityFramework.Tests", "tests\CertRenewal.EntityFramework.Tests\CertRenewal.EntityFramework.Tests.csproj", "{2A9FF3E0-44F4-4599-979A-21BE1BADEA6F}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -42,5 +46,12 @@ Global
 		{1A000000-0000-0000-0000-000000000006}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{1A000000-0000-0000-0000-000000000006}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{1A000000-0000-0000-0000-000000000006}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2A9FF3E0-44F4-4599-979A-21BE1BADEA6F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2A9FF3E0-44F4-4599-979A-21BE1BADEA6F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2A9FF3E0-44F4-4599-979A-21BE1BADEA6F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2A9FF3E0-44F4-4599-979A-21BE1BADEA6F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{2A9FF3E0-44F4-4599-979A-21BE1BADEA6F} = {281FFA43-F370-49BC-BCF9-54A599017FAE}
 	EndGlobalSection
 EndGlobal
