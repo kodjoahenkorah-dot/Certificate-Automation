@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build & test (.NET 8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore dotnet/CertRenewal.sln
+
+      - name: Build
+        run: dotnet build dotnet/CertRenewal.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test dotnet/CertRenewal.sln --configuration Release --no-build --verbosity normal
+
+  typecheck-frontend:
+    name: Typecheck frontend (TypeScript strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install typecheck dependencies
+        run: npm install --no-save typescript@5.5 @types/react@18 @types/node@20 react@18
+
+      - name: Typecheck
+        run: >
+          npx tsc --noEmit --strict --jsx react-jsx --target es2020
+          --module esnext --moduleResolution bundler --types node
+          frontend/CertificateRenewalPanel.tsx frontend/renewalApi.ts
