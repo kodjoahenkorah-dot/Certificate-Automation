@@ -42,8 +42,6 @@ automated at all.
 
 ## Safety model
 
-This is the part that mattered most, and where most of the design effort went.
-
 - **Opt-in is enforced in the engine, not the UI.** Renewal requires a policy record with an
   explicit `AutoRenewEnabled` flag *and* a recorded actor and timestamp. The gate runs on every
   path — scheduled sweep, REST trigger, even `force: true`. A UI bug cannot cause a renewal.
@@ -160,39 +158,6 @@ in-memory repositories and fake providers, and the persistence tests run against
 The persistence tests exist because EF mapping defects only surface when a real database
 materialises the model — and they immediately caught a provider-portability bug that unit tests
 alone would have missed.
-
-## Design notes
-
-<details>
-<summary><b>Why every integration point is an interface</b></summary>
-
-The package was written without access to the host codebase. Every place it touches the existing
-product — certificates table, cloud credentials, work items, notifications, authentication,
-scheduling — is a small interface with a documented default implementation, so integration is
-additive rather than invasive.
-</details>
-
-<details>
-<summary><b>Why dry-run instead of shipping the feature disabled</b></summary>
-
-A disabled feature proves nothing. Dry-run exercises the entire pipeline in the real environment
-and produces audit records as evidence that live behaviour will be correct — which makes the
-rollout decision data-driven instead of hopeful.
-</details>
-
-<details>
-<summary><b>Why the expiry date is the idempotency key</b></summary>
-
-It is stable for an entire renewal cycle and changes exactly when the problem is solved. That
-gives deduplication of work items and approvals without timers, tombstones, or state machines.
-</details>
-
-<details>
-<summary><b>Why verify after a reported success</b></summary>
-
-Cloud APIs can report success while the visible resource lags or an operation only partially
-applies. One extra read prevents recording — and acting on — a renewal that did not stick.
-</details>
 
 ## Status
 
